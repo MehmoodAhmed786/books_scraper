@@ -37,37 +37,84 @@ class BookRecord(BaseModel):
     fetched_at: str
 
 
+# --- Run Metrics Tracker ---
+class Metrics:
+    def __init__(self):
+        self.start_time = datetime.now(timezone.utc)
+        self.pages_fetched = 0
+        self.cache_hits = 0
+        self.valid_records = 0
+        self.invalid_records = 0
+        self.failed_pages = 0
+
+    def get_report(self, end_time: datetime) -> dict:
+        duration_seconds = round((end_time - self.start_time).total_seconds(), 2)
+        return {
+            "start_time": self.start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "duration_seconds": duration_seconds,
+            "pages_fetched": self.pages_fetched,
+            "cache_hits": self.cache_hits,
+            "valid_records": self.valid_records,
+            "invalid_records": self.invalid_records,
+            "failed_pages": self.failed_pages,
+        }
+
+
+metrics = Metrics()
+
+
 def fetch_page(url: str, cache_filename: str) -> str:
     """
-    Fetches a page with an identifying User-Agent and timeout.
-    Caches the response locally; reads from cache on subsequent calls.
+    Fetches a page with an identifying User-Agent, timeout, retry logic, and caching.
     """
     cache_path = CACHE_DIR / cache_filename
 
     if cache_path.exists():
+        metrics.cache_hits += 1
         html_content = cache_path.read_text(encoding="utf-8")
         size_bytes = len(html_content.encode("utf-8"))
         print(f"CACHE HIT: {cache_filename} ({size_bytes} bytes)")
         return html_content
 
-    time.sleep(POLITE_DELAY)
-    print(f"FETCH: {url}")
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        if response.status_code != 200:
-            print(f"FAILED: HTTP {response.status_code} for {url}")
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        time.sleep(POLITE_DELAY)
+        print(f"FETCH (Attempt {attempt}): {url}")
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            
+            # Non-retriable client errors
+            if response.status_code in (404, 403):
+                print(f"FAILED (Non-retriable {response.status_code}): {url}")
+                metrics.failed_pages += 1
+                return ""
+
+            if response.status_code != 200:
+                print(f"HTTP {response.status_code} on attempt {attempt} for {url}")
+                if attempt < max_attempts:
+                    time.sleep(1)
+                    continue
+                metrics.failed_pages += 1
+                return ""
+
+            # Success
+            metrics.pages_fetched += 1
+            html_content = response.text
+            size_bytes = len(html_content.encode("utf-8"))
+            cache_path.write_text(html_content, encoding="utf-8")
+            print(f"SAVED TO CACHE: {cache_filename} ({size_bytes} bytes)")
+            return html_content
+
+        except requests.RequestException as e:
+            print(f"REQUEST EXCEPTION (Attempt {attempt}): {e}")
+            if attempt < max_attempts:
+                time.sleep(1)
+                continue
+            metrics.failed_pages += 1
             return ""
 
-        html_content = response.text
-        size_bytes = len(html_content.encode("utf-8"))
-        
-        cache_path.write_text(html_content, encoding="utf-8")
-        print(f"SAVED TO CACHE: {cache_filename} ({size_bytes} bytes)")
-        return html_content
-
-    except requests.RequestException as e:
-        print(f"ERROR: Failed to fetch {url} - {e}")
-        return ""
+    return ""
 
 
 def discover_book_urls(max_pages: int = 3) -> tuple[list[tuple[str, str]], int]:
@@ -114,9 +161,6 @@ def discover_book_urls(max_pages: int = 3) -> tuple[list[tuple[str, str]], int]:
 
 
 def extract_raw_book_record(book_url: str, source_page: str, idx: int) -> dict | None:
-    """
-    Extracts raw string fields from a book detail page.
-    """
     cache_filename = f"book-detail-{idx}.html"
     fetched_timestamp = datetime.now(timezone.utc).isoformat()
     
@@ -163,41 +207,42 @@ def extract_raw_book_record(book_url: str, source_page: str, idx: int) -> dict |
 
 
 def clean_price(price_text: str) -> float:
-    """
-    Extracts float from string like '£51.77'.
-    """
     match = re.search(r"[\d.]+", price_text)
     if match:
         return float(match.group(0))
     return 0.0
 
 
-def process_and_store():
+def process_and_store(inject_fake_failure: bool = False):
     book_entries, pages_count = discover_book_urls(max_pages=3)
+
+    if inject_fake_failure:
+        # Inject one bad page intentionally to prove resilience
+        fake_url = "https://books.toscrape.com/catalogue/this-page-does-not-exist-12345/index.html"
+        book_entries.append((fake_url, "https://books.toscrape.com/catalogue/page-3.html"))
+
     valid_records = []
     error_records = []
 
     print(f"\nProcessing {len(book_entries)} detail pages...")
     for idx, (book_url, source_page) in enumerate(book_entries, start=1):
-        raw = extract_raw_book_record(book_url, source_page, idx)
-        if not raw:
-            error_records.append({"url": book_url, "reason": "Failed to fetch or parse HTML"})
-            continue
-
-        # Normalization
-        clean_data = dict(raw)
-        clean_data["price_gbp"] = clean_price(raw["price_text"])
-
-        # Validation
         try:
+            raw = extract_raw_book_record(book_url, source_page, idx)
+            if not raw:
+                error_records.append({"url": book_url, "reason": "Fetch or extraction returned empty output"})
+                metrics.invalid_records += 1
+                continue
+
+            clean_data = dict(raw)
+            clean_data["price_gbp"] = clean_price(raw["price_text"])
+
             validated = BookRecord(**clean_data)
-            # Store serializable dict (handling HttpUrl conversion to str)
             valid_records.append(validated.model_dump(mode="json"))
-        except ValidationError as ve:
-            error_records.append({
-                "record": raw,
-                "reason": str(ve)
-            })
+            metrics.valid_records += 1
+
+        except Exception as err:
+            error_records.append({"url": book_url, "reason": str(err)})
+            metrics.invalid_records += 1
 
     # Write output files
     books_file = OUTPUT_DIR / "books.json"
@@ -206,15 +251,17 @@ def process_and_store():
     errors_file = OUTPUT_DIR / "errors.json"
     errors_file.write_text(json.dumps(error_records, indent=2), encoding="utf-8")
 
-    print(f"\n--- Stage 4 Checkpoint Results ---")
-    print(f"Total valid records stored in books.json: {len(valid_records)}")
-    print(f"Total error records stored in errors.json: {len(error_records)}")
-    
-    if valid_records:
-        sample = valid_records[0]
-        print(f"Sample price_gbp type: {type(sample['price_gbp']).__name__} = {sample['price_gbp']}")
-        print(f"Sample canonical URL: {sample['product_url']}")
+    # Write run report
+    end_time = datetime.now(timezone.utc)
+    report_data = metrics.get_report(end_time)
+    report_file = OUTPUT_DIR / "run-report.json"
+    report_file.write_text(json.dumps(report_data, indent=2), encoding="utf-8")
+
+    print(f"\n--- Stage 5 Checkpoint Run Report ---")
+    print(json.dumps(report_data, indent=2))
 
 
 if __name__ == "__main__":
-    process_and_store()
+    # Set inject_fake_failure=True once to test resilience checkpoint
+    inject_test = "--test-failure" in sys.argv
+    process_and_store(inject_fake_failure=inject_test)
